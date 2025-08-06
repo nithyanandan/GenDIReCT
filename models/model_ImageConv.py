@@ -54,6 +54,7 @@ class ImageConv(nn.Module):
                 return x.squeeze() 
         
         def train(self, nepochs=2000, init_lr=1e-3, decay=0.999, plot_step=300, weighting=True, loss_type='L2', loss_reduction='mean', optimiser='Adam',
+                  check_convergence=False,
                   verbose = False, suppress_out=False):
                 
                 false_start = False
@@ -75,8 +76,7 @@ class ImageConv(nn.Module):
 
                 # Scheduler selection
                 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=l1)
-
-
+        
                 for epoch in tqdm(range(nepochs)):
                         self.conv_stack.train()
                         optimizer.zero_grad()
@@ -90,8 +90,19 @@ class ImageConv(nn.Module):
                         if not torch.isnan(loss):
                                 loss.backward()
                                 optimizer.step()
+                                if loss_reduction == 'sum':
+                                        loss = loss/self.clObj.N_independent_CIs
                                 self.train_loss.append(loss.item())
                                 self.train_images.append(self.forward().detach().cpu().numpy())
+                                
+                                if check_convergence:
+                                        if epoch > 100 and np.mean(self.train_loss[-100:]) < 1:
+                                                print('Early termination: Mitigate overfitting.')
+                                                break
+                                        # check if loss is not improving much
+                                        if epoch > 200 and np.abs(np.mean(self.train_loss[-100:]) - np.mean(self.train_loss[-200:-100])) < 1e-3:
+                                                print('Early termination: Loss convergence.')
+                                                break
                         else:
                                 print('Retry: Did not initialise well.')
                                 false_start = True
@@ -113,9 +124,9 @@ class ImageConv(nn.Module):
                                 plt.show()
 
                         scheduler.step()
-
-                if not false_start and not suppress_out:
-                        self.trained = True
+                
+                self.trained = True
+                if verbose and (not false_start) and (not suppress_out):
                         res = self.forward().detach().cpu().numpy()
                         fig, ax = plt.subplots(1, 2, figsize=(10, 5))
                         ax[0].imshow(res, cmap='afmhot', interpolation='gaussian')

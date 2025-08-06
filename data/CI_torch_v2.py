@@ -4,6 +4,9 @@ from astropy.time import Time
 import torch
 import pandas as pd
 import math
+import datetime as datetime
+from scipy.stats import median_abs_deviation as mad
+import copy
 
 from ClosureInvariants import graphUtils as GU
 from ClosureInvariants import scalarInvariants_torch as SI
@@ -16,11 +19,11 @@ warnings.filterwarnings("ignore")
 
 class Closure_Invariants():
 
-    def __init__(self, ehtarray='EHT2017.txt', subarray=None,
+    def __init__(self, obslist=None, ehtarray='EHT2017.txt', subarray=None,
                  date='2017-04-05', ra=187.7059167, dec=12.3911222, bw_hz=[230e9], psize=1.7044214966184275e-11,
-                 tint_sec=10, tadv_sec=48*60, tstart_hr=4.75, tstop_hr=6.5,
-                 uvfits_files=None, ehtimAvg=False, avg_timescale=0, 
-                 ci_mask=None, ttype=None, device=None):
+                 tint_sec=10, tadv_sec=48*60, tstart_hr=4.75, tstop_hr=6.5, 
+                 uvfits_files=None, ehtimAvg=False, avg_timescale=0, scan_avg=False,
+                 baseid=0, ci_mask=None, ttype=None, device=None):
 
         if device == None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,30 +40,48 @@ class Closure_Invariants():
 
         self.psize = psize
         
-        self.obslist = []
-        if uvfits_files is not None:
-            for uvfits in uvfits_files:
-                obs = eh.obsdata.load_uvfits(uvfits)
-                if ehtimAvg and avg_timescale > 0:
-                    # obs.add_scans()
-                    obs = obs.avg_coherent(avg_timescale, scan_avg=False)
-                self.obslist.append(obs)
+        if obslist != None:
+            self.obslist = obslist
         else:
-            for rf in bw_hz:
-                obs = array.obsdata(ra/360*24, dec, rf, 8e9, tint_sec, tadv_sec, tstart_hr, tstop_hr, mjd=int(t.mjd), timetype='UTC')
-                if ehtimAvg and avg_timescale > 0:
-                    # obs.add_scans()
-                    obs = obs.avg_coherent(avg_timescale, scan_avg=False)                
-                self.obslist.append(obs)
+            self.obslist = []
+            if uvfits_files is not None:
+                for uvfits in uvfits_files:
+                    obs = eh.obsdata.load_uvfits(uvfits)
+                    if ehtimAvg:
+                        if scan_avg:
+                            obs.add_scans()
+                            obs = obs.avg_coherent(0, scan_avg=True)
+                        elif avg_timescale > 0:
+                            obs = obs.avg_coherent(avg_timescale, scan_avg=False)
+                    obs = obs.add_scans()
+                    self.obslist.append(obs)
+            else:
+                for rf in bw_hz:
+                    obs = array.obsdata(ra/360*24, dec, rf, 8e9, tint_sec, tadv_sec, tstart_hr, tstop_hr, mjd=int(t.mjd), timetype='UTC')
+                    if ehtimAvg and avg_timescale > 0:
+                        obs = obs.avg_coherent(avg_timescale, scan_avg=False) 
+                    obs = obs.add_scans()
+                    self.obslist.append(obs)
 
-        self.set_class_quantities_from_obslist(ehtimAvg, avg_timescale)
+        self.set_class_quantities_from_obslist(ehtimAvg, avg_timescale, scan_avg=scan_avg)
         self.ci_mask = ci_mask
         self.ttype = ttype
         self.cached_ftmatrix = []
-        self.cached_uv = []
+        self.cached_uv = []        
+
+        self.baseid = baseid
 
         
-    def set_class_quantities_from_obslist(self, ehtimAvg, avg_timescale):
+    def set_class_quantities_from_obslist(self, ehtimAvg, avg_timescale, scan_avg=False):
+        for i, obs in enumerate(self.obslist):
+            if ehtimAvg:
+                if scan_avg:
+                    obs.add_scans()
+                    self.obslist[i] = obs.avg_coherent(0, scan_avg=True)
+                elif avg_timescale > 0:
+                    self.obslist[i] = obs.avg_coherent(avg_timescale, scan_avg=False)
+
+                
         uvwlist = []
         num_site_pairs = []
         site_pairs = []
@@ -69,27 +90,48 @@ class Closure_Invariants():
         timestamps = []
         sigmas = []
         obs_vislist = []
+        element_ids = {}
+
         for obs in self.obslist:
-            for tdata in obs.tlist():
+            obs.add_scans()
+            scan_boundaries = obs.scans
+            unique_station_data = [np.unique(np.concatenate((tdata['t1'], tdata['t2']))) for tdata in obs.tlist(scan_gather=True)]
+            for scan, unique_stations in zip(scan_boundaries, unique_station_data):
+                element_ids[str(scan[0])+'_'+str(scan[1])] = unique_stations
+
+            for tdata in obs.tlist(scan_gather=scan_avg):
                 num_antenna = len(np.unique(np.concatenate((tdata['t1'], tdata['t2']))))
                 if num_antenna < 3 or len(tdata['t1']) < 3:
                     continue
+
                 u, v, w = tdata['u'], tdata['v'], np.array([0 for i in tdata['u']])
                 timestamps.append(tdata['time'])
                 uvwlist.append(np.stack((u, v, w), axis=-1))
+                obs_vislist.append(tdata['vis'])
+                sigmas.append(tdata['sigma'])
+                
+
                 pairs = self.recarr_to_ndarr(tdata[['t1', 't2']], 'U32')
                 site_pairs.append(pairs)
 
-                unique_pairs = np.unique(pairs.flatten())
-                pairs = np.array([np.where(unique_pairs == i)[0][0] for i in pairs.flatten()]).reshape(pairs.shape) # using numerical alias
+
+                if not ehtimAvg and avg_timescale > 0:
+                    time = tdata['time'][0]
+                    for i, scan in enumerate(scan_boundaries):
+                        if scan[0] <= time < scan[1]:
+                            unique_stations = unique_station_data[i]
+
+
+                unique_stations = np.unique(pairs.flatten())
+
+                pairs = np.array([np.where(unique_stations == i)[0][0] for i in pairs.flatten()]).reshape(pairs.shape) # using numerical alias
 
                 if pairs.tobytes() not in site_pairs_dict:
                     current_char = chr(ord(current_char) + 1)
                     site_pairs_dict[pairs.tobytes()] = current_char
 
                 num_site_pairs.append(str(len(pairs))+site_pairs_dict[pairs.tobytes()])
-                sigmas.append(tdata['sigma'])
-                obs_vislist.append(tdata['vis'])
+
 
 
         sort_idx = np.argsort(num_site_pairs, kind='stable')
@@ -120,8 +162,12 @@ class Closure_Invariants():
         obs_vislist = np.array(obs_vislist, dtype=object)
         obs_vislist = np.concatenate(obs_vislist, axis=0)
 
+
+        self.sort_idx = sort_idx
+
         self.site_pairs = site_pairs
         self.site_ids_flat = site_ids_flat
+        self.element_ids = element_ids
         self.sigmas = sigmas
         self.obs_vislist = obs_vislist
         self.uvwlist = uvwlist
@@ -135,22 +181,25 @@ class Closure_Invariants():
             self.avg_timescale = 0
         else:
             self.avg_timescale = avg_timescale
+        self.scan_avg = scan_avg
 
         self.N_times = N_times
         self.N_idx = N_idx
 
         self.N_independent_CIs = None
 
+        self.element_ids = element_ids
 
-    def FTCI_batch(self, batch, imgs, add_th_noise=False,  th_noise_factor=1,
-                   fov=None, fovx=None, fovy=None, intensity=0, stokes=False):
+
+    def FTCI_batch(self, batch, imgs, add_th_noise=False, useObs=False, th_noise_factor=1, add_bl_noise=False, bl_noise_factor=0.1,
+                   fov=None, fovx=None, fovy=None, intensity=0, stokes=False, ttype=None, normwts=None, avg_method=0):
         # split images into batches
         imgs_batched = np.array_split(imgs, batch)
         for i, img in enumerate(imgs_batched):
             if img.shape[0] == 0:
                 continue
-            ci = self.FTCI(img, add_th_noise=add_th_noise, return_uv=False, th_noise_factor=th_noise_factor,
-                           fov=fov, fovx=fovx, fovy=fovy, intensity=intensity, stokes=stokes)
+            ci = self.FTCI(img, useObs=useObs, add_th_noise=add_th_noise, return_uv=False, th_noise_factor=th_noise_factor, add_bl_noise=add_bl_noise, bl_noise_factor=bl_noise_factor,
+                           fov=fov, fovx=fovx, fovy=fovy, intensity=intensity, stokes=stokes, ttype=ttype, normwts=normwts, avg_method=avg_method)
             if i == 0:
                 ci_batch = ci
             else:
@@ -159,10 +208,12 @@ class Closure_Invariants():
 
 
     def FTCI(self, imgs, add_th_noise=False, th_noise_factor=1,
+             add_bl_noise=False, bl_noise_factor=0.1,
              return_uv=False, return_vis=False, return_list=False,
              fov=None, fovx=None, fovy=None, intensity=0, stokes=False,
              useObs=False, avgVis=False, force_recalc_avg=False,
-             ttype=None, normwts=None):
+             ttype=None, normwts=None, train=False,
+             avg_method=0, return_avg_ids=False, avg_element_ids=True):
         
         self.N_independent_CIs = 0
 
@@ -178,8 +229,8 @@ class Closure_Invariants():
         if isinstance(imgs, np.ndarray):
             imgs = torch.tensor(imgs).to(self.device)
 
-        # swap axes to match ehtim
-        imgs = torch.swapaxes(imgs, -1, -2)
+        if not train: # swap axes to match ehtim
+            imgs = torch.swapaxes(imgs, -1, -2)
             
         ci = torch.tensor(torch.empty((self.bs, 0)))
         out_uv = []
@@ -206,9 +257,14 @@ class Closure_Invariants():
         if stokes:
             vis = vis.reshape((len(imgs), 4, -1))
             vis = self.stokes_to_Bmatrix(vis)
+
+        if add_bl_noise:
+            bl_sigmas = vis.abs()*bl_noise_factor
+            vis = self.add_noise(vis, bl_sigmas, stokes=stokes)
         
         if add_th_noise:
             vis = self.add_noise(vis, self.sigmas, th_noise_factor=th_noise_factor, stokes=stokes)
+
 
         vis_by_time = torch.split(vis, self.N_idx, dim=1)
         vis_by_time = [i.clone() for i in vis_by_time]
@@ -234,8 +290,20 @@ class Closure_Invariants():
         avg_id_list = []
         for ind, (temp_vis, uv, pairs, time) in enumerate(zip(vis_by_time, uv_by_time, self.site_pairs, time_by_time)):
 
+            # determine element ids from self.element_ids
+            if avg_element_ids:
+                test_time = time[0][0]
+                for scan, unique_stations in self.element_ids.items():
+                    scan_times = np.array(scan.split('_'), dtype=float)
+                    if scan_times[0] <= test_time < scan_times[1]:
+                        element_ids = unique_stations
+                        break
+            else:
+                element_ids = None
+
+
             if return_uv or return_list or (not self.ehtimAvg and self.avg_timescale > 0):
-                temp_ci, temp_uv, tnames = self.ClosureInvariants(temp_vis, uv=uv, pairs=pairs, stokes=stokes, normwts=normwts)
+                temp_ci, temp_uv, tnames = self.ClosureInvariants(temp_vis, uv=uv, pairs=pairs, stokes=stokes, normwts=normwts, triad_ids=element_ids)
                 if temp_uv is not None:
                     out_uv.append(temp_uv)
             else:
@@ -248,24 +316,29 @@ class Closure_Invariants():
                 temp_uv = temp_uv.reshape(1, 3, 3, -1, temp_ci.shape[-1])
                 temp_uv = temp_uv[0]
                 out_list.append([times, element_pairs, temp_uv, temp_ci.cpu().detach().numpy()])
-            
-            if not self.ehtimAvg and self.avg_timescale > 0:
-                times = time[:,0]
-                ci_indices = torch.arange(ci.shape[1], ci.shape[1]+temp_ci.shape[-2]*temp_ci.shape[-1]).reshape(temp_ci.shape[-2], temp_ci.shape[-1]).unsqueeze(0)
-                avg_list.append([times, tnames, temp_ci])
-                avg_id_list.append([times, tnames, ci_indices])
+
             
             if len(temp_ci) > 0:
+                if not self.ehtimAvg and self.avg_timescale > 0:
+                    times = time[:,0]
+                    ci_indices = torch.arange(ci.shape[1], ci.shape[1]+temp_ci.shape[-2]*temp_ci.shape[-1]).reshape(temp_ci.shape[-2], temp_ci.shape[-1]).unsqueeze(0)
+                    avg_list.append([times, tnames, temp_ci])
+                    avg_id_list.append([times, tnames, ci_indices])
                 self.N_independent_CIs += (temp_ci.shape[-1] - 1)*temp_ci.shape[-2]
                 temp_ci = temp_ci.reshape(imgs.shape[0], -1)
                 ci = torch.cat((ci, temp_ci), dim=1)
-        
     
+        if return_avg_ids:
+            return (avg_id_list)
+
         # Averaging shenanigans
         if not self.ehtimAvg and self.avg_timescale > 0:
             if self.saved_timescale != self.avg_timescale:
                 self.saved_timescale = self.avg_timescale
-                self.avg_CIs(avg_id_list, stokes=stokes, visData=avgVis)
+                if avg_method == 0:
+                    self.avg_CIs(avg_id_list, stokes=stokes, visData=avgVis) # Old method
+                else:
+                    self.set_avg_ids(avg_id_list) # new method
             if avgVis:
                 return self.avg_CIs(avg_list, stokes=stokes, visData=avgVis, indices=self.avg_IDs)
             if force_recalc_avg:
@@ -295,7 +368,7 @@ class Closure_Invariants():
         return ci
     
 
-    def ClosureInvariants(self, vis, uv=None, pairs=None, stokes=False, normwts=None):
+    def ClosureInvariants(self, vis, uv=None, pairs=None, stokes=False, normwts=None, triad_ids=None):
         """
         Calculates copolar closure invariants for visibilities assuming an n element 
         interferometer array using method 1.
@@ -313,12 +386,18 @@ class Closure_Invariants():
         """
         element_pairs = pairs[0]
         element_ids = pd.unique(np.array(element_pairs).ravel())
+
+
         dicts = []
         for p in pairs:
             unique_ids = pd.unique(np.array(p).ravel())
             dicts.append({element_ids[i]: unique_ids[i] for i in range(len(unique_ids))})
 
-        triads_indep = GU.generate_independent_triads(element_ids, baseid=element_ids[0])
+        if triad_ids is not None:
+            triads_indep = GU.generate_independent_triads(triad_ids, baseid=triad_ids[self.baseid])
+        else:
+            triads_indep = GU.generate_independent_triads(element_ids, baseid=element_ids[self.baseid])
+
         if stokes:
             pol_axes = (-2, -1)
             bl_axis = -3
@@ -398,7 +477,7 @@ class Closure_Invariants():
         vis_noise = vis + ((torch.randn_like(vis) + 1j*torch.randn_like(vis))* sigmas)
         return vis_noise
 
-    def avg_CIs(self, data_list, stokes=False, visData=False, indices=None): # timescale in seconds
+    def avg_CIs(self, data_list, stokes=False, visData=False, indices=None): 
 
         if indices is not None and not visData:
             # average based on the provided indices
@@ -445,7 +524,6 @@ class Closure_Invariants():
             triad_indices = []
             for triad in triad_list:
                 unique_times, unique_counts = torch.unique(torch.tensor([t[0] for t in triad]), return_counts=True)
-
                 if stokes:
                     # split ci by counts
                     split_ci = torch.split(torch.stack([t[1] for t in triad]), unique_counts.tolist())
@@ -469,8 +547,18 @@ class Closure_Invariants():
                     split_ci = torch.unsqueeze(split_ci, 0)
 
                 time_ind = 0
-                _, bin_edges = np.histogram(unique_times, bins=np.arange(unique_times[0]-1e-5, unique_times[-1]+1e-5, self.avg_timescale/3600))
-                bin_edges = np.append(bin_edges, unique_times[-1])
+                # if we assume single obs object, WARNING: ignores avg_timescale
+                self.obslist[0].add_scans()
+                # temp = copy.deepcopy(self.obslist[0])
+                # temp = self.obslist[0].avg_coherent(0, scan_avg=True)
+                # temp.add_scans()
+                bin_edges = np.concatenate(self.obslist[0].scans)
+
+                # brute force binning
+                # _, bin_edges = np.histogram(unique_times, bins=np.arange(unique_times[0]-1e-5, unique_times[-1]+1e-5, self.avg_timescale/3600))
+                # bin_edges = np.append(bin_edges, unique_times[-1])
+
+                
                 triad_averaged_ci = []
                 triad_averaged_ci_visdata = []
                 triad_averaged_times = []
@@ -495,6 +583,10 @@ class Closure_Invariants():
         
                 result = torch.stack(averaged_ci).T # averaged ci
             
+            #     print(triad_averaged_times)
+            #     print(unique_times)
+            
+            # print(unique_triads)
 
             if visData:
                 return visData_list
@@ -560,8 +652,11 @@ class Closure_Invariants():
         if ttype == 'direct': # Method 2: Direct
             mat = None
             for ind, i in enumerate(self.cached_uv):
-                if torch.allclose(i, uv):
-                    mat = self.cached_ftmatrix[ind]
+                try:
+                    if torch.allclose(i, uv):
+                        mat = self.cached_ftmatrix[ind]
+                except:
+                    pass
             if mat == None:
                 mat = self.ftmatrix(xfov/1e6/206265/imgs.shape[-1], imgs.shape[-2], imgs.shape[-1], uv).to(self.device).permute(1,0)  # assuming xfov and yfov are the same
                 self.cached_ftmatrix.append(mat)
@@ -627,26 +722,88 @@ class Closure_Invariants():
 
     def get_CI_MCerror(self, img, n=100, add_th_noise=True, th_noise_factor=1, useObs=False,
                         fov=None, fovx=None, fovy=None, intensity=0, stokes=False,
-                        ttype=None):
+                        ttype=None, normwts=None, avg_method=0):
         imgs = torch.tensor(np.array([img for _ in range(n)]))
-        noisy_CIs = self.FTCI(imgs, add_th_noise=add_th_noise, th_noise_factor=th_noise_factor, useObs=useObs,
+        noisy_CIs = self.FTCI_batch(64, imgs, add_th_noise=add_th_noise, th_noise_factor=th_noise_factor, useObs=useObs,
                         fov=fov, fovx=fovx, fovy=fovy, intensity=intensity, stokes=stokes,
-                        ttype=ttype)
-        CI_sigmas = torch.std(noisy_CIs, dim=0)
+                        ttype=ttype, normwts=normwts, avg_method=avg_method)
+        CI_sigmas = torch.std(noisy_CIs, dim=0) # std
+        # CI_sigmas = mad(noisy_CIs, axis=0) # median absolute deviation
         self.CI_sigmas = CI_sigmas
         return CI_sigmas
 
-    def replace_obs_vis(self, img, obs=None, xfov=225, yfov=225, stokes=False, ttype='DFT'): # only implemented I for now
+    def replace_obs_vis(self, img, vis=[], obs=None, xfov=225, yfov=225, stokes=False, ttype='direct'): # only implemented I for now
         if obs == None:
-            obs = self.obslist[0]
-        uv = torch.tensor(np.stack([self.obslist[0].data['u'], self.obslist[0].data['v']])).swapaxes(0,1).to(self.device)
-        new_vis = self.Visibilities(img.swapaxes(1,2), uv=uv, xfov=xfov, yfov=yfov, stokes=stokes, ttype=ttype)[0].detach().cpu().numpy()
-
-        # Image = eh.image.Image(img.squeeze(), xfov/1e6/206265/img.shape[-1], obs.ra, obs.dec, rf=obs.rf, mjd=obs.mjd)
-        # new_obs = Image.observe_same(obs, ttype='direct')
+            obslist = self.obslist
+        else:
+            obslist = [obs]
+        for ind, obs in enumerate(obslist):
+            if len(vis) == 0:
+                uv = torch.tensor(np.stack([obs.data['u'], obs.data['v']])).swapaxes(0,1).to(self.device)
+                new_vis = self.Visibilities(img.swapaxes(1,2), uv=uv, xfov=xfov, yfov=yfov, stokes=stokes, ttype=ttype)[0].detach().cpu().numpy()
+            else:
+                new_vis = vis
+            # Image = eh.image.Image(img.squeeze(), xfov/1e6/206265/img.shape[-1], obs.ra, obs.dec, rf=obs.rf, mjd=obs.mjd)
+            # new_obs = Image.observe_same(obs, ttype='direct')
         
-        obs.data['vis'] = new_vis
-        # obs.data['sigma'] = new_obs.data['sigma']
-        self.obslist[0] = obs
-        self.set_class_quantities_from_obslist(self.ehtimAvg, self.avg_timescale)
+            obs.data['vis'] = new_vis
+            # obs.data['sigma'] = new_obs.data['sigma']
+            self.obslist[ind] = obs
+        self.set_class_quantities_from_obslist(self.ehtimAvg, self.avg_timescale, self.scan_avg)
         return 
+
+    def replace_vislist(self, vis, obs=None, ehtimAvg=False, avg_timescale=0, scan_avg=False): # only works for one obs in obslist for now, so far this is only used for PaperII_Averaging
+        if obs == None: 
+            obs = self.obslist[0]
+            
+        obs.data['vis'] = vis
+        if ehtimAvg:
+            if scan_avg:
+                obs.add_scans()
+                obs = obs.avg_coherent(0, scan_avg=True)
+            elif avg_timescale > 0:
+                obs = obs.avg_coherent(avg_timescale, scan_avg=False)
+        
+        obs_vislist = []
+        for tdata in obs.tlist(scan_gather=scan_avg):
+                num_antenna = len(np.unique(np.concatenate((tdata['t1'], tdata['t2']))))
+                if num_antenna < 3 or len(tdata['t1']) < 3:
+                    continue
+                obs_vislist.append(tdata['vis'])
+
+        obs_vislist = [obs_vislist[i] for i in self.sort_idx]
+        obs_vislist = np.array(obs_vislist, dtype=object)
+        obs_vislist = np.concatenate(obs_vislist, axis=0)
+
+        self.obs_vislist = obs_vislist
+    
+        return obs, obs_vislist
+    
+    def make_df(self, avg_id_list):
+        df = pd.DataFrame()
+        time_list, stations_list, id_list = [], [], []
+        for i in avg_id_list:
+            for t, s, ids in zip(i[0], i[1], i[2][0]):
+                for i, (stations, id) in enumerate(zip(s, ids)):
+                    time_list.append(t.numpy())
+                    if i < s.shape[0]//2:
+                        stations_list.append('-'.join(sorted(stations.tolist())))
+                    else:
+                        stations_list.append('--'.join(sorted(stations.tolist())))
+                    id_list.append(id)
+        df['time'] = time_list
+        df['time'] = df['time'].astype(float)
+        df['stations'] = stations_list
+        df['id'] = id_list
+        return df
+
+
+    def set_avg_ids(self, avg_id_list):
+        t0 = datetime.datetime(1960,1,1)
+        df = self.make_df(avg_id_list)
+        df['datetime'] = df['time'].apply(lambda x: t0 + datetime.timedelta(hours=x))
+        df['rounded_time'] = list(map(lambda x: np.floor((x- t0).total_seconds()/float(self.avg_timescale)), df['datetime']))
+        df_grouped = df.groupby(['rounded_time', 'stations']).agg(list).reset_index()
+
+        new_avg_ids = df_grouped['id'].apply(lambda x: torch.stack([torch.tensor(i) for i in x], dim=0)).tolist()
+        self.avg_IDs = new_avg_ids

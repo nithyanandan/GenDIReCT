@@ -158,13 +158,11 @@ class imgTransforms():
         ])
 
 
-    def gauss_noise_tensor(self, img):
+    def gauss_noise_tensor(self, img, sigma=0.1):
         assert isinstance(img, torch.Tensor)
         dtype = img.dtype
         if not img.is_floating_point():
             img = img.to(torch.float32)
-        
-        sigma = 0.1
         
         out = img + sigma * torch.randn_like(img)
         
@@ -230,7 +228,7 @@ class imgTransforms():
             
         return out
 
-    def radial_taper_v2(self, img, radii_range=(1, 24), blur_fwhm_range=(10, 20), fixed=False):
+    def radial_taper_v2(self, img, radii_range=(3, 24), blur_fwhm_range=(10, 20), fixed=False):
         assert isinstance(img, torch.Tensor)
         dtype = img.dtype
         if not img.is_floating_point():

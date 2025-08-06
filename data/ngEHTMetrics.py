@@ -21,11 +21,11 @@ class Metrics():
             self.psize = psize
 
 
-    def update_clObj(self):
-        new_obs = self.gt_img.observe_same_nonoise(self.clObj.obslist[0], ttype='direct')
+    def update_clObj(self, ttype='direct'):
+        new_obs = self.gt_img.observe_same_nonoise(self.clObj.obslist[0], ttype=ttype)
         self.clObj.obslist[0] = new_obs
         self.clObj.set_class_quantities_from_obslist(ehtimAvg=self.clObj.ehtimAvg, avg_timescale=self.avg_timescale)
-        self.clObj.replace_obs_vis(torch.tensor(self.gt_img.imarr().astype(np.float32)).unsqueeze(0), xfov=self.clObj.psize*206265*1e6*self.test_img.imarr().shape[-2], yfov=self.clObj.psize*206265*1e6*self.test_img.imarr().shape[-1])
+        self.clObj.replace_obs_vis(torch.tensor(self.gt_img.imarr().astype(np.float32)).unsqueeze(0), xfov=self.clObj.psize*206265*1e6*self.test_img.imarr().shape[-2], yfov=self.clObj.psize*206265*1e6*self.test_img.imarr().shape[-1], ttype=ttype)
         return
             
     def calc_nxcorr(self, outputs, labels):
@@ -47,7 +47,8 @@ class Metrics():
         return idx, torch.abs(nxcorr_flat[torch.arange(nxcorr_flat.shape[0]), idx])/dim**2
 
     def nxcorr(self):
-        return self.gt_img.compare_images(self.test_img, metric='nxcorr')[0][0]
+        gt_img = self.gt_img.regrid_image(self.psize*self.imgdim, self.imgdim)
+        return gt_img.compare_images(self.test_img, metric='nxcorr')[0][0]
 
     def match_img_obs(self, obs, img):
         img.mjd = obs.mjd
@@ -72,7 +73,6 @@ class Metrics():
         obs, image = self.match_img_obs(obs, self.test_img)
         image._imdict['I'] = image.imarr().flatten()/np.sum(image.imarr())
         # image._imdict['I'] = image.imarr().swapaxes(0, 1).flatten()
-
         truth_ci, uv = self.clObj.FTCI(torch.tensor(image.imarr()).unsqueeze(0), useObs=True, add_th_noise=False, return_uv=True, normwts=None)
         img_ci = self.clObj.FTCI(torch.tensor(image.imarr()).unsqueeze(0), useObs=False, add_th_noise=False, normwts=None)
         ci_sigma = self.clObj.get_CI_MCerror(torch.tensor(image.imarr()).unsqueeze(0), n=1000, useObs=True, th_noise_factor=1)
